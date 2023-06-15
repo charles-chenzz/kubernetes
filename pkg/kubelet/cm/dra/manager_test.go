@@ -18,17 +18,87 @@ package dra
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 	v1 "k8s.io/api/core/v1"
 	resourcev1alpha2 "k8s.io/api/resource/v1alpha2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/resourceclaim"
+	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/cm/dra/plugin"
 	"k8s.io/kubernetes/pkg/kubelet/cm/dra/state"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"testing"
 )
+
+const (
+	driverName      = "test-cdi-device"
+	driverClassName = "test"
+)
+
+var (
+	socketName string
+	stopCh     = make(chan struct{})
+)
+
+type fakeDRADriverGRPCServer struct {
+	drapbv1.UnimplementedNodeServer
+	driverName string
+	mutex      sync.Mutex
+	devices    map[string]string
+}
+
+func (s *fakeDRADriverGRPCServer) NodePrepareResource(ctx context.Context, req *drapbv1.NodePrepareResourceRequest) (*drapbv1.NodePrepareResourceResponse, error) {
+	deviceName := "claim-" + req.ClaimUid
+	result := s.driverName + "/" + driverClassName + "=" + deviceName
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.devices[deviceName] = result
+	return &drapbv1.NodePrepareResourceResponse{CdiDevices: []string{result}}, nil
+}
+
+func (s *fakeDRADriverGRPCServer) NodeUnprepareResource(ctx context.Context, req *drapbv1.NodeUnprepareResourceRequest) (*drapbv1.NodeUnprepareResourceResponse, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	delete(s.devices, "claim-"+req.ClaimUid)
+	return &drapbv1.NodeUnprepareResourceResponse{}, nil
+}
+
+func setupFakeDRADriverGRPCServer(t *testing.T) {
+	socketDir, err := os.MkdirTemp("", "dra")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	socketName = filepath.Join(socketDir, "server.sock")
+
+	l, err := net.Listen("unix", socketName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := grpc.NewServer()
+	fakeDRADriverGRPCServer := &fakeDRADriverGRPCServer{
+		mutex:      sync.Mutex{},
+		devices:    make(map[string]string),
+		driverName: driverName,
+	}
+
+	drapbv1.RegisterNodeServer(s, fakeDRADriverGRPCServer)
+
+	go func() {
+		go s.Serve(l)
+		<-stopCh
+		s.GracefulStop()
+	}()
+}
 
 func TestNewManagerImpl(t *testing.T) {
 	kubeClient := fake.NewSimpleClientset()
@@ -82,19 +152,17 @@ func TestGetResources(t *testing.T) {
 		t.Errorf("Failed to create DRA manager: %v", err)
 	}
 
-	var annotation []kubecontainer.Annotation
-	annotation = []kubecontainer.Annotation{
+	annotation := []kubecontainer.Annotation{
 		{
 			Name:  "test-annotation",
 			Value: "123",
 		},
 	}
 
-	var cis state.ClaimInfoState
-	cis = state.ClaimInfoState{
+	cis := state.ClaimInfoState{
 		ClaimName: "test-pod-claim-1",
 		CDIDevices: map[string][]string{
-			"test-cdi-device": {"123"},
+			driverName: {"123"},
 		},
 		Namespace: "test-namespace",
 	}
@@ -111,6 +179,8 @@ func TestGetResources(t *testing.T) {
 func TestPrepareResources(t *testing.T) {
 	// Create a fake kubeClient for testing
 	fakeKubeClient := fake.NewSimpleClientset()
+	// Create a fake DRA Driver gRPC server
+	setupFakeDRADriverGRPCServer(t)
 
 	cache, err := newClaimInfoCache(t.TempDir(), draManagerStateFileName)
 	if err != nil {
@@ -152,10 +222,10 @@ func TestPrepareResources(t *testing.T) {
 			ResourceClassName: "test-class",
 		},
 		Status: resourcev1alpha2.ResourceClaimStatus{
-			DriverName: "test-driver",
+			DriverName: driverName,
 			Allocation: &resourcev1alpha2.AllocationResult{
 				ResourceHandles: []resourcev1alpha2.ResourceHandle{
-					{Data: "test-data", DriverName: "test-driver"},
+					{Data: "test-data", DriverName: driverName},
 				},
 			},
 			ReservedFor: []resourcev1alpha2.ResourceClaimConsumerReference{
@@ -164,21 +234,18 @@ func TestPrepareResources(t *testing.T) {
 		},
 	}
 
-	_, err = fakeKubeClient.ResourceV1alpha2().ResourceClaims(pod.Namespace).Create(context.Background(), resourceClaim, metav1.CreateOptions{})
-	if err != nil {
+	if _, err := fakeKubeClient.ResourceV1alpha2().ResourceClaims(pod.Namespace).Create(context.Background(), resourceClaim, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to create ResourceClaim: %+v", err)
 	}
 
 	plg := plugin.NewRegistrationHandler()
-	err = plg.RegisterPlugin("test-driver", "127.0.0.1", []string{"1.27"}) //this place won't pass the CI
-	if err != nil {
+	if err := plg.RegisterPlugin(driverName, socketName, []string{"1.27"}); err != nil {
 		t.Fatalf("failed to register plugin err:%v", err)
 	}
 
 	// Call the PrepareResources method
-	err = manager.PrepareResources(pod)
-	if err != nil {
-		t.Fatalf("error:%v", err)
+	if err := manager.PrepareResources(pod); err != nil {
+		t.Fatalf("failed to prepare resources: %v", err)
 	}
 
 	// check the cache contains the expected claim info
@@ -196,8 +263,9 @@ func TestPrepareResources(t *testing.T) {
 	if len(claimInfo.PodUIDs) != 1 || !claimInfo.PodUIDs.Has(string(pod.UID)) {
 		t.Fatalf("podUIDs mismatch: expected [%s], got %v", pod.UID, claimInfo.PodUIDs)
 	}
-	if len(claimInfo.CDIDevices[resourceClaim.Status.DriverName]) != 1 || claimInfo.CDIDevices[resourceClaim.Status.DriverName][0] != "test-cdi-device" {
-		t.Fatalf("cdiDevices mismatch: expected [%s], got %v", []string{"test-cdi-device"}, claimInfo.CDIDevices[resourceClaim.Status.DriverName])
+	expectedResourceClaimDriverName := fmt.Sprintf("%s/%s=claim-%s", driverName, driverClassName, string(resourceClaim.Status.ReservedFor[0].UID))
+	if len(claimInfo.CDIDevices[resourceClaim.Status.DriverName]) != 1 || claimInfo.CDIDevices[resourceClaim.Status.DriverName][0] != expectedResourceClaimDriverName {
+		t.Fatalf("cdiDevices mismatch: expected [%s], got %v", []string{expectedResourceClaimDriverName}, claimInfo.CDIDevices[resourceClaim.Status.DriverName])
 	}
 }
 
@@ -244,10 +312,10 @@ func TestUnprepareResources(t *testing.T) {
 			ResourceClassName: "test-class",
 		},
 		Status: resourcev1alpha2.ResourceClaimStatus{
-			DriverName: "test-driver",
+			DriverName: driverName,
 			Allocation: &resourcev1alpha2.AllocationResult{
 				ResourceHandles: []resourcev1alpha2.ResourceHandle{
-					{Data: "test-data", DriverName: "test-driver"},
+					{Data: "test-data", DriverName: driverName},
 				},
 			},
 			ReservedFor: []resourcev1alpha2.ResourceClaimConsumerReference{
@@ -256,17 +324,15 @@ func TestUnprepareResources(t *testing.T) {
 		},
 	}
 
-	_, err = fakeKubeClient.ResourceV1alpha2().ResourceClaims(pod.Namespace).Create(context.Background(), resourceClaim, metav1.CreateOptions{})
-	if err != nil {
+	if _, err := fakeKubeClient.ResourceV1alpha2().ResourceClaims(pod.Namespace).Create(context.Background(), resourceClaim, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to create ResourceClaim: %+v", err)
 	}
 
 	manager.cache.add(&ClaimInfo{ClaimInfoState: state.ClaimInfoState{ClaimName: "test-resource-claim", Namespace: "test-namespace"}})
 
 	// Call the UnprepareResources method
-	err = manager.UnprepareResources(pod)
-	if err != nil {
-		return
+	if err := manager.UnprepareResources(pod); err != nil {
+		t.Fatalf("failed to unprepare resources: %v", err)
 	}
 
 	// Check that the cache has been updated correctly
@@ -276,10 +342,11 @@ func TestUnprepareResources(t *testing.T) {
 		t.Fatalf("claimInfo still found in cache after calling UnprepareResources")
 	}
 
+	// Allow the fake DRA Driver gRPC server to shutdown gracefully
+	close(stopCh)
 }
 
 func TestGetContainerClaimInfos(t *testing.T) {
-
 	cache, err := newClaimInfoCache(t.TempDir(), draManagerStateFileName)
 	if err != nil {
 		t.Fatalf("error occur:%v", err)
